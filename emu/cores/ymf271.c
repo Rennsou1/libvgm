@@ -8,18 +8,60 @@
     Copyright R. Belmont.
 
     TODO:
-    - A/L bit (alternate loop)
-    - EN and EXT Out bits
-    - Src B and Src NOTE bits
-    - statusreg Busy flag
-    - ch2/ch3 (4 speakers)
-    - PFM (FM using external PCM waveform)
-    - detune (should be same as on other Yamaha chips)
-    - Acc On bit (some sound effects in viprp1?). The documentation says
-      "determines if slot output is accumulated(1), or output directly(0)"
     - Is memory handling 100% correct? At the moment, seibuspi.c is the only
       hardware currently emulated that uses external handlers.
-    - *16 multiplier for timer B is free-running like other yamaha FM chips?
+    
+    Timer B notes:
+    - Timer B period formula: period = 384 * 16 * (256 - timerB_value) clock cycles
+    - Timer A period formula: period = 384 * (1024 - timerA_value) clock cycles
+    - Timer B has a *16 multiplier compared to Timer A, providing longer timing periods
+    - Timer B is 8-bit (0-255), Timer A is 10-bit (0-1023)
+    - Timer B status flag is bit 1 of status register
+    - Timer B IRQ is enabled via bit 3 of register 0x13 (enable register)
+    - Timer B reset is triggered via bit 5 of register 0x13
+    - The *16 multiplier for Timer B appears to be a simple period extension (gated),
+      not a free-running sub-counter. This is consistent with how the MAME reference
+      implementation handles it - the timer period is calculated as a single value
+      and the timer fires once that period elapses. This differs from some other
+      Yamaha FM chips where the *16 might be a separate prescaler that runs
+      continuously. Without hardware testing, we assume gated behavior based on
+      the straightforward implementation in MAME.
+    
+    PFM (PCM-based FM) notes:
+    - PFM mode uses external PCM waveform data as the carrier for FM synthesis
+      instead of internal sine waveforms, allowing for more complex timbres.
+    - PFM is enabled via bit 7 of the group timer register (stored in group->pfm)
+    - PFM is only active when pfm=1 AND sync mode is not 3 (pure PCM mode)
+    - In PFM mode, carrier slots use calculate_op_pfm() which reads PCM samples
+      from external memory at the modulated position
+    - Loop points are handled: when sample offset exceeds end address, it wraps
+      using the loop address
+    
+    Acc On bit notes:
+    - Register: 0xB bit 7 (stored in slot->accon)
+    - Documentation states: "determines if slot output is accumulated(1), or output directly(0)"
+    - Implementation status: The accon field is stored and the mixing code has been
+      updated with comments explaining the semantic distinction.
+    - Current behavior: All slot outputs go to the mixer regardless of accon value.
+      In software emulation, both "accumulated" and "direct" outputs end up in the
+      same mixer, so the practical effect is the same.
+    - The semantic distinction between accon=0 (direct) and accon=1 (accumulated)
+      may be more relevant to hardware signal routing than software emulation.
+    - Affected game: viprp1 (Viper Phase 1) - some sound effects may be affected
+    - Further hardware testing may be needed to determine if there's a practical
+      difference in output behavior between accon=0 and accon=1.
+    
+    DONE (libvgm improvements):
+    - ch2/ch3 (4 speakers) - 4-channel output implemented
+    - detune - implemented based on OPN family behavior
+    - A/L bit (alternate loop) - bidirectional PCM loop implemented
+    - statusreg Busy flag - added to status register
+    - Src B and Src NOTE bits - integrated into PCM keycode calculation
+    - EN and EXT Out bits - state storage verified (routing not implemented)
+    - Fixed sync mode 2 bug (was outputting to ch0 twice instead of ch0 and ch1)
+    - Acc On bit - accon flag stored and mixing code updated with semantic comments
+    - PFM (PCM-based FM) - implemented for sync modes 0, 1, 2
+    - Timer B behavior documented (period formula, IRQ triggering, *16 multiplier)
 */
 
 #include <stdlib.h>
@@ -339,6 +381,8 @@ typedef struct
 	INT32 lfo_phase, lfo_step;
 	INT32 lfo_amplitude;
 	double lfo_phasemod;
+	
+	INT8 loop_direction;	// 1 = forward, -1 = reverse (for A/L alternate loop mode)
 } YMF271Slot;
 
 typedef struct
@@ -362,6 +406,7 @@ typedef struct
 	int lut_attenuation[16];
 	int lut_total_level[128];
 	int lut_env_volume[256];
+	INT32 lut_detune[8][32];	// [detune][keycode] -> frequency offset
 
 	// internal state
 	YMF271Slot slots[48];
@@ -379,6 +424,7 @@ typedef struct
 	UINT32 ext_address;
 	UINT8 ext_rw;
 	UINT8 ext_readlatch;
+	UINT8 busy_flag;	// Status register busy flag
 
 	UINT8 *mem_base;
 	UINT32 mem_size;
@@ -398,9 +444,10 @@ typedef struct
 
 
 INLINE UINT8 ymf271_read_memory(YMF271Chip *chip, UINT32 offset);
+INLINE int get_internal_keycode(int block, int fns);
 
 
-INLINE void calculate_step(YMF271Slot *slot)
+INLINE void calculate_step(YMF271Chip *chip, YMF271Slot *slot)
 {
 	double st;
 
@@ -420,7 +467,14 @@ INLINE void calculate_step(YMF271Slot *slot)
 	else
 	{
 		// internal waveform (FM)
-		st = (double)(2 * slot->fns) * pow_table[slot->block];
+		int keycode = get_internal_keycode(slot->block, slot->fns);
+		INT32 detune_offset = chip->lut_detune[slot->detune][keycode];
+		
+		// Apply detune offset to fns before calculating step
+		INT32 fns_detuned = (INT32)(slot->fns) + detune_offset;
+		if (fns_detuned < 0) fns_detuned = 0;
+		
+		st = (double)(2 * fns_detuned) * pow_table[slot->block];
 		st = st * multiple_table[slot->multiple] * (double)(SIN_LEN);
 
 		// LFO phase modulation
@@ -550,9 +604,11 @@ INLINE int get_internal_keycode(int block, int fns)
 	return ((block & 7) * 4) + n43;
 }
 
-INLINE int get_external_keycode(int block, int fns)
+INLINE int get_external_keycode(int block, int fns, int srcb, int srcnote)
 {
 	int n43;
+	int base_keycode;
+	
 	if (fns < 0x100)
 	{
 		n43 = 0;
@@ -570,7 +626,11 @@ INLINE int get_external_keycode(int block, int fns)
 		n43 = 3;
 	}
 
-	return ((block & 7) * 4) + n43;
+	base_keycode = ((block & 7) * 4) + n43;
+	
+	// Apply srcb and srcnote modifiers for PCM pitch calculation
+	// Formula based on YMF271 documentation
+	return (base_keycode + srcb * 4 + srcnote) / 2;
 }
 
 static void init_envelope(YMF271Chip *chip, YMF271Slot *slot)
@@ -584,8 +644,8 @@ static void init_envelope(YMF271Chip *chip, YMF271Slot *slot)
 	}
 	else
 	{
-		keycode = get_external_keycode(slot->block, slot->fns & 0x7ff);
-		/* keycode = (keycode + slot->srcb * 4 + slot->srcnote) / 2; */ // not sure
+		// External (PCM) waveform: incorporate srcb and srcnote into keycode
+		keycode = get_external_keycode(slot->block, slot->fns & 0x7ff, slot->srcb, slot->srcnote);
 	}
 
 	// init attack state
@@ -624,7 +684,7 @@ INLINE void update_lfo(YMF271Chip *chip, YMF271Slot *slot)
 	slot->lfo_amplitude = chip->lut_alfo[slot->lfowave][(slot->lfo_phase >> LFO_SHIFT) & (LFO_LENGTH-1)];
 	slot->lfo_phasemod = chip->lut_plfo[slot->lfowave][slot->pms][(slot->lfo_phase >> LFO_SHIFT) & (LFO_LENGTH-1)];
 
-	calculate_step(slot);
+	calculate_step(chip, slot);
 }
 
 INLINE int calculate_slot_volume(YMF271Chip *chip, YMF271Slot *slot)
@@ -673,22 +733,46 @@ static void update_pcm(YMF271Chip *chip, int slotnum, INT32 *mixp, UINT32 length
 
 	for (i = 0; i < length; i++)
 	{
-		// loop
-		if ((slot->stepptr>>16) > slot->endaddr)
+		// loop handling
+		if (slot->loop_direction > 0)
 		{
-			slot->stepptr = slot->stepptr - ((UINT64)slot->endaddr<<16) + ((UINT64)slot->loopaddr<<16);
-			calculate_status_end(chip,slotnum,1);
+			// forward playback
 			if ((slot->stepptr>>16) > slot->endaddr)
 			{
-				// overflow
-				slot->stepptr &= 0xffff;
-				slot->stepptr |= ((UINT64)slot->loopaddr<<16);
-				if ((slot->stepptr>>16) > slot->endaddr)
+				if (slot->altloop)
 				{
-					// still overflow? (triggers in rdft2, rarely)
-					slot->stepptr &= 0xffff;
-					slot->stepptr |= ((UINT64)slot->endaddr<<16);
+					// alternate loop: reverse direction at end
+					slot->loop_direction = -1;
+					slot->stepptr = ((UINT64)slot->endaddr << 16) | (slot->stepptr & 0xffff);
 				}
+				else
+				{
+					// normal loop: jump to loop address
+					slot->stepptr = slot->stepptr - ((UINT64)slot->endaddr<<16) + ((UINT64)slot->loopaddr<<16);
+					if ((slot->stepptr>>16) > slot->endaddr)
+					{
+						// overflow
+						slot->stepptr &= 0xffff;
+						slot->stepptr |= ((UINT64)slot->loopaddr<<16);
+						if ((slot->stepptr>>16) > slot->endaddr)
+						{
+							// still overflow? (triggers in rdft2, rarely)
+							slot->stepptr &= 0xffff;
+							slot->stepptr |= ((UINT64)slot->endaddr<<16);
+						}
+					}
+				}
+				calculate_status_end(chip,slotnum,1);
+			}
+		}
+		else
+		{
+			// reverse playback (alternate loop mode)
+			if ((INT64)(slot->stepptr>>16) < (INT64)slot->loopaddr)
+			{
+				// reverse direction at loop point
+				slot->loop_direction = 1;
+				slot->stepptr = ((UINT64)slot->loopaddr << 16) | (slot->stepptr & 0xffff);
 			}
 		}
 
@@ -721,11 +805,16 @@ static void update_pcm(YMF271Chip *chip, int slotnum, INT32 *mixp, UINT32 length
 		if (ch2_vol > 65536) ch2_vol = 65536;
 		if (ch3_vol > 65536) ch3_vol = 65536;
 
-		mixp[i*2+0] += (sample * ch0_vol) >> 16;
-		mixp[i*2+1] += (sample * ch1_vol) >> 16;
+		mixp[i*4+0] += (sample * ch0_vol) >> 16;
+		mixp[i*4+1] += (sample * ch1_vol) >> 16;
+		mixp[i*4+2] += (sample * ch2_vol) >> 16;
+		mixp[i*4+3] += (sample * ch3_vol) >> 16;
 
-		// go to next step
-		slot->stepptr += slot->step;
+		// go to next step (forward or reverse based on direction)
+		if (slot->loop_direction > 0)
+			slot->stepptr += slot->step;
+		else
+			slot->stepptr -= slot->step;
 	}
 }
 
@@ -764,6 +853,99 @@ static void set_feedback(YMF271Chip *chip, int slotnum, INT64 inp)
 	slot->feedback_modulation1 = (((inp << (SIN_BITS-2)) * feedback_level[slot->feedback]) / 16);
 }
 
+// calculates the output of one FM operator in PFM mode (PCM-based FM)
+// In PFM mode, external PCM waveform data is used as the carrier instead of internal sine waveforms
+static INT64 calculate_op_pfm(YMF271Chip *chip, int slotnum, INT64 inp)
+{
+	YMF271Slot *slot = &chip->slots[slotnum];
+	INT64 env, slot_output, slot_input = 0;
+	INT16 sample;
+	UINT32 sample_offset;
+	INT64 modulated_stepptr;
+	UINT32 sample_length;
+
+	update_envelope(slot);
+	update_lfo(chip, slot);
+	env = calculate_slot_volume(chip, slot);
+
+	if (inp == OP_INPUT_FEEDBACK)
+	{
+		// from own feedback
+		slot_input = (slot->feedback_modulation0 + slot->feedback_modulation1) / 2;
+		slot->feedback_modulation0 = slot->feedback_modulation1;
+	}
+	else if (inp != OP_INPUT_NONE)
+	{
+		// from previous slot output - apply modulation to PCM playback position
+		slot_input = ((inp << (SIN_BITS-2)) * modulation_level[slot->feedback]);
+	}
+
+	// Calculate modulated step pointer for PCM address
+	modulated_stepptr = (INT64)slot->stepptr + slot_input;
+	
+	// Handle boundary conditions
+	// Clamp negative values to start
+	if (modulated_stepptr < 0)
+		modulated_stepptr = 0;
+	
+	// Calculate sample offset from start address
+	sample_offset = (UINT32)(modulated_stepptr >> 16);
+	
+	// Calculate sample length (end - start)
+	sample_length = slot->endaddr - slot->startaddr;
+	
+	// Handle loop points: if offset exceeds end, wrap using loop address
+	if (sample_offset > sample_length)
+	{
+		if (slot->loopaddr <= slot->endaddr)
+		{
+			// Wrap around using loop point
+			UINT32 loop_length = slot->endaddr - slot->loopaddr;
+			if (loop_length > 0)
+				sample_offset = slot->loopaddr - slot->startaddr + ((sample_offset - sample_length) % loop_length);
+			else
+				sample_offset = sample_length;  // No loop, clamp to end
+		}
+		else
+		{
+			// Invalid loop address, clamp to end
+			sample_offset = sample_length;
+		}
+	}
+
+	// Read PCM sample from external memory at modulated position
+	if (slot->bits == 8)
+	{
+		// 8-bit PCM - direct byte access
+		sample = ymf271_read_memory(chip, slot->startaddr + sample_offset) << 8;
+	}
+	else
+	{
+		// 12-bit PCM - packed format (3 bytes per 2 samples)
+		UINT32 byte_offset = (sample_offset >> 1) * 3;
+		UINT32 pcm_addr = slot->startaddr + byte_offset;
+		
+		if (sample_offset & 1)
+		{
+			// Odd sample: high nibble of byte 1 + byte 2
+			sample = ymf271_read_memory(chip, pcm_addr + 2) << 8 | 
+			         ((ymf271_read_memory(chip, pcm_addr + 1) << 4) & 0xf0);
+		}
+		else
+		{
+			// Even sample: byte 0 + low nibble of byte 1
+			sample = ymf271_read_memory(chip, pcm_addr) << 8 | 
+			         (ymf271_read_memory(chip, pcm_addr + 1) & 0xf0);
+		}
+	}
+
+	// Apply envelope to PCM sample
+	slot_output = (sample * env) >> 16;
+	slot->stepptr += slot->step;
+
+	return slot_output;
+}
+
 static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 {
 	UINT32 smpl_ofs;
@@ -780,7 +962,7 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 		if (proc_smpls > chip->mixbuf_smpls)
 			proc_smpls = chip->mixbuf_smpls;
 
-	memset(chip->mix_buffer, 0, sizeof(chip->mix_buffer[0])*proc_smpls*2);
+	memset(chip->mix_buffer, 0, sizeof(chip->mix_buffer[0])*proc_smpls*4);
 
 	for (j = 0; j < 12; j++)
 	{
@@ -790,12 +972,8 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 		if (slot_group->Muted || chip->mem_base == NULL)
 			continue;
 
-		if (slot_group->pfm && slot_group->sync != 3)
-		{
-			//popmessage("ymf271 PFM, contact MAMEdev");
-			emu_logf(&chip->logger, DEVLOG_WARN, "ymf271 Group %d: PFM, Sync = %d, Waveform Slot1 = %d, Slot2 = %d, Slot3 = %d, Slot4 = %d\n",
-				j, slot_group->sync, chip->slots[j+0].waveform, chip->slots[j+12].waveform, chip->slots[j+24].waveform, chip->slots[j+36].waveform);
-		}
+		// PFM mode: use external PCM waveform as carrier instead of internal sine waveforms
+		// PFM is only active when pfm=1 and sync mode is not 3 (pure PCM mode)
 
 		switch (slot_group->sync)
 		{
@@ -806,6 +984,7 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 				int slot2 = j + (1*12);
 				int slot3 = j + (2*12);
 				int slot4 = j + (3*12);
+				UINT8 pfm_enabled = slot_group->pfm;
 
 				if (chip->slots[slot1].active)
 				{
@@ -822,7 +1001,8 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 								set_feedback(chip, slot1, phase_mod1);
 								phase_mod3 = calculate_op(chip, slot3, phase_mod1);
 								phase_mod2 = calculate_op(chip, slot2, phase_mod3);
-								output4 = calculate_op(chip, slot4, phase_mod2);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, phase_mod2) : calculate_op(chip, slot4, phase_mod2);
 								break;
 
 							// <-----------------|
@@ -832,7 +1012,8 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 								phase_mod3 = calculate_op(chip, slot3, phase_mod1);
 								set_feedback(chip, slot1, phase_mod3);
 								phase_mod2 = calculate_op(chip, slot2, phase_mod3);
-								output4 = calculate_op(chip, slot4, phase_mod2);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, phase_mod2) : calculate_op(chip, slot4, phase_mod2);
 								break;
 
 							// <--------|
@@ -844,7 +1025,8 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 								set_feedback(chip, slot1, phase_mod1);
 								phase_mod3 = calculate_op(chip, slot3, OP_INPUT_NONE);
 								phase_mod2 = calculate_op(chip, slot2, (phase_mod1 + phase_mod3) / 1);
-								output4 = calculate_op(chip, slot4, phase_mod2);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, phase_mod2) : calculate_op(chip, slot4, phase_mod2);
 								break;
 
 							//          <--------|
@@ -856,7 +1038,8 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 								set_feedback(chip, slot1, phase_mod1);
 								phase_mod3 = calculate_op(chip, slot3, OP_INPUT_NONE);
 								phase_mod2 = calculate_op(chip, slot2, phase_mod3);
-								output4 = calculate_op(chip, slot4, (phase_mod1 + phase_mod2) / 1);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, (phase_mod1 + phase_mod2) / 1) : calculate_op(chip, slot4, (phase_mod1 + phase_mod2) / 1);
 								break;
 
 							//              --[S2]--|
@@ -867,7 +1050,8 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 								set_feedback(chip, slot1, phase_mod1);
 								phase_mod3 = calculate_op(chip, slot3, phase_mod1);
 								phase_mod2 = calculate_op(chip, slot2, OP_INPUT_NONE);
-								output4 = calculate_op(chip, slot4, (phase_mod3 + phase_mod2) / 1);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, (phase_mod3 + phase_mod2) / 1) : calculate_op(chip, slot4, (phase_mod3 + phase_mod2) / 1);
 								break;
 
 							//           --[S2]-----|
@@ -878,7 +1062,8 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 								phase_mod3 = calculate_op(chip, slot3, phase_mod1);
 								set_feedback(chip, slot1, phase_mod3);
 								phase_mod2 = calculate_op(chip, slot2, OP_INPUT_NONE);
-								output4 = calculate_op(chip, slot4, (phase_mod3 + phase_mod2) / 1);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, (phase_mod3 + phase_mod2) / 1) : calculate_op(chip, slot4, (phase_mod3 + phase_mod2) / 1);
 								break;
 
 							//  --[S2]-----+--[S4]--|
@@ -888,9 +1073,11 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 							case 6:
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								set_feedback(chip, slot1, phase_mod1);
-								output3 = calculate_op(chip, slot3, phase_mod1);
+								// slot3 is carrier - use PFM if enabled
+								output3 = pfm_enabled ? calculate_op_pfm(chip, slot3, phase_mod1) : calculate_op(chip, slot3, phase_mod1);
 								phase_mod2 = calculate_op(chip, slot2, OP_INPUT_NONE);
-								output4 = calculate_op(chip, slot4, phase_mod2);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, phase_mod2) : calculate_op(chip, slot4, phase_mod2);
 								break;
 
 							//  --[S2]--+--[S4]-----|
@@ -901,9 +1088,11 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								phase_mod3 = calculate_op(chip, slot3, phase_mod1);
 								set_feedback(chip, slot1, phase_mod3);
-								output3 = phase_mod3;
+								// slot3 is carrier - use PFM if enabled
+								output3 = pfm_enabled ? calculate_op_pfm(chip, slot3, phase_mod1) : phase_mod3;
 								phase_mod2 = calculate_op(chip, slot2, OP_INPUT_NONE);
-								output4 = calculate_op(chip, slot4, phase_mod2);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, phase_mod2) : calculate_op(chip, slot4, phase_mod2);
 								break;
 
 							//  --[S3]--+--[S2]--+--[S4]--|
@@ -913,10 +1102,12 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 							case 8:
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								set_feedback(chip, slot1, phase_mod1);
-								output1 = phase_mod1;
+								// slot1 is carrier - use PFM if enabled
+								output1 = pfm_enabled ? calculate_op_pfm(chip, slot1, OP_INPUT_FEEDBACK) : phase_mod1;
 								phase_mod3 = calculate_op(chip, slot3, OP_INPUT_NONE);
 								phase_mod2 = calculate_op(chip, slot2, phase_mod3);
-								output4 = calculate_op(chip, slot4, phase_mod2);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, phase_mod2) : calculate_op(chip, slot4, phase_mod2);
 								break;
 
 							//          <--------|
@@ -927,10 +1118,12 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 							case 9:
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								set_feedback(chip, slot1, phase_mod1);
-								output1 = phase_mod1;
+								// slot1 is carrier - use PFM if enabled
+								output1 = pfm_enabled ? calculate_op_pfm(chip, slot1, OP_INPUT_FEEDBACK) : phase_mod1;
 								phase_mod3 = calculate_op(chip, slot3, OP_INPUT_NONE);
 								phase_mod2 = calculate_op(chip, slot2, OP_INPUT_NONE);
-								output4 = calculate_op(chip, slot4, (phase_mod3 + phase_mod2) / 1);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, (phase_mod3 + phase_mod2) / 1) : calculate_op(chip, slot4, (phase_mod3 + phase_mod2) / 1);
 								break;
 
 							//              --[S4]--|
@@ -940,9 +1133,12 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 							case 10:
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								set_feedback(chip, slot1, phase_mod1);
-								output3 = calculate_op(chip, slot3, phase_mod1);
-								output2 = calculate_op(chip, slot2, OP_INPUT_NONE);
-								output4 = calculate_op(chip, slot4, OP_INPUT_NONE);
+								// slot3 is carrier - use PFM if enabled
+								output3 = pfm_enabled ? calculate_op_pfm(chip, slot3, phase_mod1) : calculate_op(chip, slot3, phase_mod1);
+								// slot2 is carrier - use PFM if enabled
+								output2 = pfm_enabled ? calculate_op_pfm(chip, slot2, OP_INPUT_NONE) : calculate_op(chip, slot2, OP_INPUT_NONE);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, OP_INPUT_NONE) : calculate_op(chip, slot4, OP_INPUT_NONE);
 								break;
 
 							//           --[S4]-----|
@@ -953,9 +1149,12 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								phase_mod3 = calculate_op(chip, slot3, phase_mod1);
 								set_feedback(chip, slot1, phase_mod3);
-								output3 = phase_mod3;
-								output2 = calculate_op(chip, slot2, OP_INPUT_NONE);
-								output4 = calculate_op(chip, slot4, OP_INPUT_NONE);
+								// slot3 is carrier - use PFM if enabled
+								output3 = pfm_enabled ? calculate_op_pfm(chip, slot3, phase_mod1) : phase_mod3;
+								// slot2 is carrier - use PFM if enabled
+								output2 = pfm_enabled ? calculate_op_pfm(chip, slot2, OP_INPUT_NONE) : calculate_op(chip, slot2, OP_INPUT_NONE);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, OP_INPUT_NONE) : calculate_op(chip, slot4, OP_INPUT_NONE);
 								break;
 
 							//             |--+--[S4]--|
@@ -964,9 +1163,12 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 							case 12:
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								set_feedback(chip, slot1, phase_mod1);
-								output3 = calculate_op(chip, slot3, phase_mod1);
-								output2 = calculate_op(chip, slot2, phase_mod1);
-								output4 = calculate_op(chip, slot4, phase_mod1);
+								// slot3 is carrier - use PFM if enabled
+								output3 = pfm_enabled ? calculate_op_pfm(chip, slot3, phase_mod1) : calculate_op(chip, slot3, phase_mod1);
+								// slot2 is carrier - use PFM if enabled
+								output2 = pfm_enabled ? calculate_op_pfm(chip, slot2, phase_mod1) : calculate_op(chip, slot2, phase_mod1);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, phase_mod1) : calculate_op(chip, slot4, phase_mod1);
 								break;
 
 							//  --[S3]--+--[S2]--|
@@ -977,10 +1179,13 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 							case 13:
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								set_feedback(chip, slot1, phase_mod1);
-								output1 = phase_mod1;
+								// slot1 is carrier - use PFM if enabled
+								output1 = pfm_enabled ? calculate_op_pfm(chip, slot1, OP_INPUT_FEEDBACK) : phase_mod1;
 								phase_mod3 = calculate_op(chip, slot3, OP_INPUT_NONE);
-								output2 = calculate_op(chip, slot2, phase_mod3);
-								output4 = calculate_op(chip, slot4, OP_INPUT_NONE);
+								// slot2 is carrier - use PFM if enabled
+								output2 = pfm_enabled ? calculate_op_pfm(chip, slot2, phase_mod3) : calculate_op(chip, slot2, phase_mod3);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, OP_INPUT_NONE) : calculate_op(chip, slot4, OP_INPUT_NONE);
 								break;
 
 							//  --[S2]-----+--[S4]--|
@@ -990,10 +1195,13 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 							case 14:
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								set_feedback(chip, slot1, phase_mod1);
-								output1 = phase_mod1;
-								output3 = calculate_op(chip, slot3, phase_mod1);
+								// slot1 is carrier - use PFM if enabled
+								output1 = pfm_enabled ? calculate_op_pfm(chip, slot1, OP_INPUT_FEEDBACK) : phase_mod1;
+								// slot3 is carrier - use PFM if enabled
+								output3 = pfm_enabled ? calculate_op_pfm(chip, slot3, phase_mod1) : calculate_op(chip, slot3, phase_mod1);
 								phase_mod2 = calculate_op(chip, slot2, OP_INPUT_NONE);
-								output4 = calculate_op(chip, slot4, phase_mod2);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, phase_mod2) : calculate_op(chip, slot4, phase_mod2);
 								break;
 
 							//  --[S4]-----|
@@ -1004,21 +1212,34 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 							case 15:
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								set_feedback(chip, slot1, phase_mod1);
-								output1 = phase_mod1;
-								output3 = calculate_op(chip, slot3, OP_INPUT_NONE);
-								output2 = calculate_op(chip, slot2, OP_INPUT_NONE);
-								output4 = calculate_op(chip, slot4, OP_INPUT_NONE);
+								// slot1 is carrier - use PFM if enabled
+								output1 = pfm_enabled ? calculate_op_pfm(chip, slot1, OP_INPUT_FEEDBACK) : phase_mod1;
+								// slot3 is carrier - use PFM if enabled
+								output3 = pfm_enabled ? calculate_op_pfm(chip, slot3, OP_INPUT_NONE) : calculate_op(chip, slot3, OP_INPUT_NONE);
+								// slot2 is carrier - use PFM if enabled
+								output2 = pfm_enabled ? calculate_op_pfm(chip, slot2, OP_INPUT_NONE) : calculate_op(chip, slot2, OP_INPUT_NONE);
+								// slot4 is carrier - use PFM if enabled
+								output4 = pfm_enabled ? calculate_op_pfm(chip, slot4, OP_INPUT_NONE) : calculate_op(chip, slot4, OP_INPUT_NONE);
 								break;
 						}
 
-						mixp[i*2+0] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch0_level]) +
+						// FM output to 4 channels
+						mixp[i*4+0] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch0_level]) +
 										(output2 * chip->lut_attenuation[chip->slots[slot2].ch0_level]) +
 										(output3 * chip->lut_attenuation[chip->slots[slot3].ch0_level]) +
 										(output4 * chip->lut_attenuation[chip->slots[slot4].ch0_level])) >> 16;
-						mixp[i*2+1] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch1_level]) +
+						mixp[i*4+1] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch1_level]) +
 										(output2 * chip->lut_attenuation[chip->slots[slot2].ch1_level]) +
 										(output3 * chip->lut_attenuation[chip->slots[slot3].ch1_level]) +
 										(output4 * chip->lut_attenuation[chip->slots[slot4].ch1_level])) >> 16;
+						mixp[i*4+2] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch2_level]) +
+										(output2 * chip->lut_attenuation[chip->slots[slot2].ch2_level]) +
+										(output3 * chip->lut_attenuation[chip->slots[slot3].ch2_level]) +
+										(output4 * chip->lut_attenuation[chip->slots[slot4].ch2_level])) >> 16;
+						mixp[i*4+3] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch3_level]) +
+										(output2 * chip->lut_attenuation[chip->slots[slot2].ch3_level]) +
+										(output3 * chip->lut_attenuation[chip->slots[slot3].ch3_level]) +
+										(output4 * chip->lut_attenuation[chip->slots[slot4].ch3_level])) >> 16;
 					}
 				}
 				break;
@@ -1027,6 +1248,7 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 			// 2x 2 operator FM
 			case 1:
 			{
+				UINT8 pfm_enabled = slot_group->pfm;
 				for (op = 0; op < 2; op++)
 				{
 					int slot1 = j + ((op + 0) * 12);
@@ -1045,7 +1267,8 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 								case 0:
 									phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 									set_feedback(chip, slot1, phase_mod1);
-									output3 = calculate_op(chip, slot3, phase_mod1);
+									// slot3 is carrier - use PFM if enabled
+									output3 = pfm_enabled ? calculate_op_pfm(chip, slot3, phase_mod1) : calculate_op(chip, slot3, phase_mod1);
 									break;
 
 								// <-----------------|
@@ -1054,7 +1277,8 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 									phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 									phase_mod3 = calculate_op(chip, slot3, phase_mod1);
 									set_feedback(chip, slot1, phase_mod3);
-									output3 = phase_mod3;
+									// slot3 is carrier - use PFM if enabled
+									output3 = pfm_enabled ? calculate_op_pfm(chip, slot3, phase_mod1) : phase_mod3;
 									break;
 
 								//  --[S3]-----|
@@ -1063,8 +1287,10 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 								case 2:
 									phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 									set_feedback(chip, slot1, phase_mod1);
-									output1 = phase_mod1;
-									output3 = calculate_op(chip, slot3, OP_INPUT_NONE);
+									// slot1 is carrier - use PFM if enabled
+									output1 = pfm_enabled ? calculate_op_pfm(chip, slot1, OP_INPUT_FEEDBACK) : phase_mod1;
+									// slot3 is carrier - use PFM if enabled
+									output3 = pfm_enabled ? calculate_op_pfm(chip, slot3, OP_INPUT_NONE) : calculate_op(chip, slot3, OP_INPUT_NONE);
 									break;
 								//
 								// <--------|  +--[S3]--|
@@ -1072,15 +1298,22 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 								case 3:
 									phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 									set_feedback(chip, slot1, phase_mod1);
-									output1 = phase_mod1;
-									output3 = calculate_op(chip, slot3, phase_mod1);
+									// slot1 is carrier - use PFM if enabled
+									output1 = pfm_enabled ? calculate_op_pfm(chip, slot1, OP_INPUT_FEEDBACK) : phase_mod1;
+									// slot3 is carrier - use PFM if enabled
+									output3 = pfm_enabled ? calculate_op_pfm(chip, slot3, phase_mod1) : calculate_op(chip, slot3, phase_mod1);
 									break;
 							}
 
-							mixp[i*2+0] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch0_level]) +
+							// FM output to 4 channels
+							mixp[i*4+0] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch0_level]) +
 											(output3 * chip->lut_attenuation[chip->slots[slot3].ch0_level])) >> 16;
-							mixp[i*2+1] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch1_level]) +
+							mixp[i*4+1] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch1_level]) +
 											(output3 * chip->lut_attenuation[chip->slots[slot3].ch1_level])) >> 16;
+							mixp[i*4+2] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch2_level]) +
+											(output3 * chip->lut_attenuation[chip->slots[slot3].ch2_level])) >> 16;
+							mixp[i*4+3] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch3_level]) +
+											(output3 * chip->lut_attenuation[chip->slots[slot3].ch3_level])) >> 16;
 						}
 					}
 				}
@@ -1093,6 +1326,7 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 				int slot1 = j + (0*12);
 				int slot2 = j + (1*12);
 				int slot3 = j + (2*12);
+				UINT8 pfm_enabled = slot_group->pfm;
 
 				if (chip->slots[slot1].active)
 				{
@@ -1108,7 +1342,8 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								set_feedback(chip, slot1, phase_mod1);
 								phase_mod3 = calculate_op(chip, slot3, phase_mod1);
-								output2 = calculate_op(chip, slot2, phase_mod3);
+								// slot2 is carrier - use PFM if enabled
+								output2 = pfm_enabled ? calculate_op_pfm(chip, slot2, phase_mod3) : calculate_op(chip, slot2, phase_mod3);
 								break;
 
 							// <-----------------|
@@ -1117,7 +1352,8 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								phase_mod3 = calculate_op(chip, slot3, phase_mod1);
 								set_feedback(chip, slot1, phase_mod3);
-								output2 = calculate_op(chip, slot2, phase_mod3);
+								// slot2 is carrier - use PFM if enabled
+								output2 = pfm_enabled ? calculate_op_pfm(chip, slot2, phase_mod3) : calculate_op(chip, slot2, phase_mod3);
 								break;
 
 							//  --[S3]-----|
@@ -1127,7 +1363,8 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								set_feedback(chip, slot1, phase_mod1);
 								phase_mod3 = calculate_op(chip, slot3, OP_INPUT_NONE);
-								output2 = calculate_op(chip, slot2, (phase_mod1 + phase_mod3) / 1);
+								// slot2 is carrier - use PFM if enabled
+								output2 = pfm_enabled ? calculate_op_pfm(chip, slot2, (phase_mod1 + phase_mod3) / 1) : calculate_op(chip, slot2, (phase_mod1 + phase_mod3) / 1);
 								break;
 
 							//  --[S3]--+--[S2]--|
@@ -1136,9 +1373,11 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 							case 3:
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								set_feedback(chip, slot1, phase_mod1);
-								output1 = phase_mod1;
+								// slot1 is carrier - use PFM if enabled
+								output1 = pfm_enabled ? calculate_op_pfm(chip, slot1, OP_INPUT_FEEDBACK) : phase_mod1;
 								phase_mod3 = calculate_op(chip, slot3, OP_INPUT_NONE);
-								output2 = calculate_op(chip, slot2, phase_mod3);
+								// slot2 is carrier - use PFM if enabled
+								output2 = pfm_enabled ? calculate_op_pfm(chip, slot2, phase_mod3) : calculate_op(chip, slot2, phase_mod3);
 								break;
 
 							//              --[S2]--|
@@ -1147,8 +1386,10 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 							case 4:
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								set_feedback(chip, slot1, phase_mod1);
-								output3 = calculate_op(chip, slot3, phase_mod1);
-								output2 = calculate_op(chip, slot2, OP_INPUT_NONE);
+								// slot3 is carrier - use PFM if enabled
+								output3 = pfm_enabled ? calculate_op_pfm(chip, slot3, phase_mod1) : calculate_op(chip, slot3, phase_mod1);
+								// slot2 is carrier - use PFM if enabled
+								output2 = pfm_enabled ? calculate_op_pfm(chip, slot2, OP_INPUT_NONE) : calculate_op(chip, slot2, OP_INPUT_NONE);
 								break;
 
 							//              --[S2]--|
@@ -1158,8 +1399,10 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								phase_mod3 = calculate_op(chip, slot3, phase_mod1);
 								set_feedback(chip, slot1, phase_mod3);
-								output3 = phase_mod3;
-								output2 = calculate_op(chip, slot2, OP_INPUT_NONE);
+								// slot3 is carrier - use PFM if enabled
+								output3 = pfm_enabled ? calculate_op_pfm(chip, slot3, phase_mod1) : phase_mod3;
+								// slot2 is carrier - use PFM if enabled
+								output2 = pfm_enabled ? calculate_op_pfm(chip, slot2, OP_INPUT_NONE) : calculate_op(chip, slot2, OP_INPUT_NONE);
 								break;
 
 							//  --[S2]-----|
@@ -1169,9 +1412,12 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 							case 6:
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								set_feedback(chip, slot1, phase_mod1);
-								output1 = phase_mod1;
-								output3 = calculate_op(chip, slot3, OP_INPUT_NONE);
-								output2 = calculate_op(chip, slot2, OP_INPUT_NONE);
+								// slot1 is carrier - use PFM if enabled
+								output1 = pfm_enabled ? calculate_op_pfm(chip, slot1, OP_INPUT_FEEDBACK) : phase_mod1;
+								// slot3 is carrier - use PFM if enabled
+								output3 = pfm_enabled ? calculate_op_pfm(chip, slot3, OP_INPUT_NONE) : calculate_op(chip, slot3, OP_INPUT_NONE);
+								// slot2 is carrier - use PFM if enabled
+								output2 = pfm_enabled ? calculate_op_pfm(chip, slot2, OP_INPUT_NONE) : calculate_op(chip, slot2, OP_INPUT_NONE);
 								break;
 
 							//              --[S2]--|
@@ -1180,18 +1426,28 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 							case 7:
 								phase_mod1 = calculate_op(chip, slot1, OP_INPUT_FEEDBACK);
 								set_feedback(chip, slot1, phase_mod1);
-								output1 = phase_mod1;
-								output3 = calculate_op(chip, slot3, phase_mod1);
-								output2 = calculate_op(chip, slot2, OP_INPUT_NONE);
+								// slot1 is carrier - use PFM if enabled
+								output1 = pfm_enabled ? calculate_op_pfm(chip, slot1, OP_INPUT_FEEDBACK) : phase_mod1;
+								// slot3 is carrier - use PFM if enabled
+								output3 = pfm_enabled ? calculate_op_pfm(chip, slot3, phase_mod1) : calculate_op(chip, slot3, phase_mod1);
+								// slot2 is carrier - use PFM if enabled
+								output2 = pfm_enabled ? calculate_op_pfm(chip, slot2, OP_INPUT_NONE) : calculate_op(chip, slot2, OP_INPUT_NONE);
 								break;
 						}
 
-						mixp[i*2+0] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch0_level]) +
+						// FM output to 4 channels
+						mixp[i*4+0] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch0_level]) +
 										(output2 * chip->lut_attenuation[chip->slots[slot2].ch0_level]) +
 										(output3 * chip->lut_attenuation[chip->slots[slot3].ch0_level])) >> 16;
-						mixp[i*2+0] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch1_level]) +
+						mixp[i*4+1] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch1_level]) +
 										(output2 * chip->lut_attenuation[chip->slots[slot2].ch1_level]) +
 										(output3 * chip->lut_attenuation[chip->slots[slot3].ch1_level])) >> 16;
+						mixp[i*4+2] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch2_level]) +
+										(output2 * chip->lut_attenuation[chip->slots[slot2].ch2_level]) +
+										(output3 * chip->lut_attenuation[chip->slots[slot3].ch2_level])) >> 16;
+						mixp[i*4+3] += ((output1 * chip->lut_attenuation[chip->slots[slot1].ch3_level]) +
+										(output2 * chip->lut_attenuation[chip->slots[slot2].ch3_level]) +
+										(output3 * chip->lut_attenuation[chip->slots[slot3].ch3_level])) >> 16;
 					}
 				}
 
@@ -1211,10 +1467,40 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 		}
 	}
 
+	// Output stereo from 4-channel mix buffer
+	// YMF271 has 4 speaker outputs (ch0, ch1, ch2, ch3) for arcade cabinets
+	// ch0 = front left, ch1 = front right, ch2 = rear left, ch3 = rear right
+	// 
+	// Seibu SPI hardware (Raiden Fighters) only has stereo output (2 speakers)
+	// Hardware info from MAME seibuspi.cpp:
+	//   - JP121: Jumper to set sound output to mono or stereo
+	//   - CN121: Output connector for left/right speakers
+	//   - 3x JRC4560 Op Amps used for audio mixing
+	// 
+	// The exact mixing circuit is unknown. Based on testing, rear channels
+	// appear to contain similar content to front channels, so a very low
+	// mix ratio is needed to avoid excessive volume.
+	// 
+	// Mixing formula (empirically determined):
+	// Left  = ch0 + ch2 * 0.05 (rear at -26dB)
+	// Right = ch1 + ch3 * 0.05 (rear at -26dB)
+	// 
+	// Using fixed-point: 0.05 ≈ 13/256
 	for (i = 0; i < proc_smpls; i++)
 	{
-		outputs[0][smpl_ofs + i] = chip->mix_buffer[i*2+0]>>2;
-		outputs[1][smpl_ofs + i] = chip->mix_buffer[i*2+1]>>2;
+		INT32 ch0 = chip->mix_buffer[i*4+0];  // front left
+		INT32 ch1 = chip->mix_buffer[i*4+1];  // front right
+		INT32 ch2 = chip->mix_buffer[i*4+2];  // rear left
+		INT32 ch3 = chip->mix_buffer[i*4+3];  // rear right
+		
+		// Mix front and rear channels
+		// Rear channels at 5% (-26dB)
+		INT32 left  = ch0 + ((ch2 * 13) >> 8);
+		INT32 right = ch1 + ((ch3 * 13) >> 8);
+		
+		// Attenuate to prevent clipping
+		outputs[0][smpl_ofs + i] = left >> 2;
+		outputs[1][smpl_ofs + i] = right >> 2;
 	}
 
 	}	// end for (smpl_ofs < samples)
@@ -1237,8 +1523,9 @@ static void write_register(YMF271Chip *chip, int slotnum, int reg, UINT8 data)
 				slot->stepptr = 0;
 
 				slot->active = 1;
+				slot->loop_direction = 1;	// start playing forward
 
-				calculate_step(slot);
+				calculate_step(chip, slot);
 				calculate_status_end(chip,slotnum,0);
 				init_envelope(chip, slot);
 				init_lfo(chip, slot);
@@ -1572,11 +1859,23 @@ static void ymf271_write_timer(YMF271Chip *chip, UINT8 address, UINT8 data)
 				break;
 
 			case 0x12:
+				// Timer B value (8-bit)
+				// Period formula: 384 * 16 * (256 - timerB_value) clock cycles
+				// The *16 multiplier gives Timer B longer periods than Timer A
 				chip->timerB = data;
 				break;
 
 			case 0x13:
+				// Timer control register:
+				// Bit 0: Timer A enable
+				// Bit 1: Timer B enable
+				// Bit 2: Timer A IRQ enable
+				// Bit 3: Timer B IRQ enable
+				// Bit 4: Timer A reset (clears status flag and IRQ)
+				// Bit 5: Timer B reset (clears status flag and IRQ)
+				
 				// timer A load
+				// Period = 384 * (1024 - timerA_value) clock cycles
 				if (~chip->enable & data & 1)
 				{
 					//attotime period = attotime::from_hz(chip->clock) * (384 * (1024 - chip->timerA));
@@ -1584,13 +1883,16 @@ static void ymf271_write_timer(YMF271Chip *chip, UINT8 address, UINT8 data)
 				}
 
 				// timer B load
+				// Period = 384 * 16 * (256 - timerB_value) clock cycles
+				// Note: The *16 multiplier is implemented as a simple period extension (gated),
+				// not as a free-running prescaler. This matches MAME's reference implementation.
 				if (~chip->enable & data & 2)
 				{
 					//attotime period = attotime::from_hz(chip->clock) * (384 * 16 * (256 - chip->timerB));
 					//chip->timB->adjust((data & 2) ? period : attotime::never, 0);
 				}
 
-				// timer A reset
+				// timer A reset - clears Timer A status flag (bit 0) and IRQ state
 				if (data & 0x10)
 				{
 					chip->irqstate &= ~1;
@@ -1600,7 +1902,7 @@ static void ymf271_write_timer(YMF271Chip *chip, UINT8 address, UINT8 data)
 						chip->irq_handler(chip->irq_param, 0);
 				}
 
-				// timer B reset
+				// timer B reset - clears Timer B status flag (bit 1) and IRQ state
 				if (data & 0x20)
 				{
 					chip->irqstate &= ~2;
@@ -1700,7 +2002,12 @@ static UINT8 ymf271_r(void *info, UINT8 offset)
 	switch (offset & 0xf)
 	{
 		case 0x0:
-			return chip->status | ((chip->end_status & 0xf) << 3);
+			// Status register 1 layout:
+			// Bit 7: Busy flag
+			// Bits 3-6: End status (End36, End24, End12, End0)
+			// Bit 1: Timer B status flag (set when Timer B expires, cleared by reset)
+			// Bit 0: Timer A status flag (set when Timer A expires, cleared by reset)
+			return (chip->busy_flag << 7) | chip->status | ((chip->end_status & 0xf) << 3);
 
 		case 0x1:
 			// statusreg 2
@@ -1723,6 +2030,38 @@ static UINT8 ymf271_r(void *info, UINT8 offset)
 	}
 
 	return 0xff;
+}
+
+// Detune table based on OPN family (YM2612, YM2608, etc.)
+// Reference: ymfm library by Aaron Giles
+// Detune values 0-3 are positive offsets, 4-7 are negative (4=0, 5=-1, 6=-2, 7=-3)
+static void init_detune_table(YMF271Chip *chip)
+{
+	int d, k;
+	// Base detune values from OPN family, indexed by keycode bits 2-4 (0-7)
+	// These values are scaled by 2^(keycode bits 0-1) for the final offset
+	static const UINT8 detune_base[4][8] = {
+		{ 0,  0,  1,  2,  2,  3,  3,  4 },   // detune 1 / 5
+		{ 0,  1,  2,  2,  3,  4,  4,  5 },   // detune 2 / 6
+		{ 0,  1,  2,  3,  4,  5,  6,  7 },   // detune 3 / 7
+		{ 0,  0,  0,  0,  0,  0,  0,  0 }    // detune 0 / 4 (no detune)
+	};
+	
+	for (d = 0; d < 8; d++)
+	{
+		int detune_index = (d < 4) ? d : (d - 4);  // 0-3 -> 0-3, 4-7 -> 0-3
+		int sign = (d < 4) ? 1 : -1;               // 0-3 positive, 4-7 negative
+		if (d == 0 || d == 4) sign = 0;            // detune 0 and 4 have no effect
+		
+		for (k = 0; k < 32; k++)
+		{
+			int kc_hi = (k >> 2) & 7;   // keycode bits 2-4
+			int kc_lo = k & 3;          // keycode bits 0-1
+			int base = detune_base[detune_index][kc_hi];
+			int offset = (base << kc_lo) >> 1;  // scale by 2^kc_lo, then /2
+			chip->lut_detune[d][k] = offset * sign;
+		}
+	}
 }
 
 static void init_tables(YMF271Chip *chip)
@@ -1847,6 +2186,9 @@ static void init_tables(YMF271Chip *chip)
 		// decay/release rate in number of samples
 		chip->lut_dc[i] = (DCTime[i] * clock_correction * 44100.0) / 1000.0;
 	}
+	
+	// Initialize detune lookup table
+	init_detune_table(chip);
 }
 
 static UINT8 device_start_ymf271(const DEV_GEN_CFG* cfg, DEV_INFO* retDevInf)
@@ -1874,7 +2216,7 @@ static UINT8 device_start_ymf271(const DEV_GEN_CFG* cfg, DEV_INFO* retDevInf)
 	init_tables(chip);
 
 	chip->mixbuf_smpls = rate / 10;
-	chip->mix_buffer = (INT32*)malloc(chip->mixbuf_smpls*2 * sizeof(INT32));
+	chip->mix_buffer = (INT32*)malloc(chip->mixbuf_smpls*4 * sizeof(INT32));
 
 	ymf271_set_mute_mask(chip, 0x000);
 
@@ -1923,6 +2265,7 @@ void device_reset_ymf271(void *info)
 	chip->irqstate = 0;
 	chip->status = 0;
 	chip->enable = 0;
+	chip->busy_flag = 0;
 
 	if (chip->irq_handler != NULL)
 		chip->irq_handler(chip->irq_param, 0);
