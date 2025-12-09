@@ -185,19 +185,8 @@ if(USE_SANITIZERS)
 	add_sanitizers(audemutest)
 endif(USE_SANITIZERS)
 
-add_executable(ymf271_pfm_test tests/ymf271/test_pfm.c)
-target_include_directories(ymf271_pfm_test PRIVATE ${LIBVGM_SOURCE_DIR})
-target_link_libraries(ymf271_pfm_test PRIVATE vgm-emu)
-if(USE_SANITIZERS)
-	add_sanitizers(ymf271_pfm_test)
-endif(USE_SANITIZERS)
-
-add_executable(ymf271_timer_b_test tests/ymf271/test_timer_b.c)
-target_include_directories(ymf271_timer_b_test PRIVATE ${LIBVGM_SOURCE_DIR})
-target_link_libraries(ymf271_timer_b_test PRIVATE vgm-emu)
-if(USE_SANITIZERS)
-	add_sanitizers(ymf271_timer_b_test)
-endif(USE_SANITIZERS)
+# YMF271 emulation tests (organized in subdirectory)
+add_subdirectory(tests/ymf271)
 
 find_package(ZLIB REQUIRED)
 

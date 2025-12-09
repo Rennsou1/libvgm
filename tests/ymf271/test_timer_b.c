@@ -1,12 +1,17 @@
 /**
- * YMF271 Timer B Property Tests
+ * YMF271 Timer Property Tests
  * 
- * This file contains property-based tests for the YMF271 Timer B functionality.
+ * This file contains property-based tests for the YMF271 Timer functionality.
  * 
- * **Feature: ymf271-improvements, Property 13: Timer B Period Calculation**
+ * **Feature: ymf271-emulation-improvement, Property 3: Timer A Period**
+ * For any Timer A value (0-1023), the timer period SHALL equal 
+ * 384 * (1024 - timerA_value) clock cycles.
+ * **Validates: Requirements 4.1**
+ * 
+ * **Feature: ymf271-emulation-improvement, Property 4: Timer B Period**
  * For any Timer B value (0-255), the timer period SHALL equal 
  * 384 * 16 * (256 - timerB_value) clock cycles.
- * **Validates: Requirements 10.1, 10.2**
+ * **Validates: Requirements 4.2**
  */
 
 #include <stdio.h>
@@ -65,10 +70,83 @@ static UINT32 calculate_timer_a_period(UINT16 timerA_value)
 }
 
 /**
- * Property 13: Timer B Period Calculation
+ * Property 3: Timer A Period Calculation
+ * 
+ * For any Timer A value (0-1023), the timer period SHALL equal 
+ * 384 * (1024 - timerA_value) clock cycles.
+ * 
+ * **Feature: ymf271-emulation-improvement, Property 3: Timer A Period**
+ * **Validates: Requirements 4.1**
+ * 
+ * Test approach:
+ * - Verify the period formula produces correct values for all inputs
+ * - Verify boundary conditions (0, 1023)
+ */
+static int test_timer_a_period_calculation(void)
+{
+    int iteration;
+    int passed = 1;
+    
+    printf("Property 3: Timer A Period Calculation\n");
+    printf("  Testing Timer A period formula: 384 * (1024 - value)...\n");
+    
+    /* Test boundary conditions first */
+    {
+        UINT32 period_0 = calculate_timer_a_period(0);
+        UINT32 period_1023 = calculate_timer_a_period(1023);
+        UINT32 expected_0 = 384 * 1024;  /* Maximum period */
+        UINT32 expected_1023 = 384 * 1;  /* Minimum period */
+        
+        if (period_0 != expected_0)
+        {
+            printf("  FAILED: Timer A value 0 should give period %u, got %u\n", 
+                   expected_0, period_0);
+            passed = 0;
+        }
+        
+        if (period_1023 != expected_1023)
+        {
+            printf("  FAILED: Timer A value 1023 should give period %u, got %u\n", 
+                   expected_1023, period_1023);
+            passed = 0;
+        }
+        
+        printf("  Boundary test: value=0 -> period=%u (max), value=1023 -> period=%u (min)\n",
+               period_0, period_1023);
+    }
+    
+    /* Test random values */
+    for (iteration = 0; iteration < TEST_ITERATIONS; iteration++)
+    {
+        UINT16 timerA_value = (UINT16)(test_rand() % 1024);
+        UINT32 calculated_period = calculate_timer_a_period(timerA_value);
+        UINT32 expected_period = 384 * (1024 - timerA_value);
+        
+        if (calculated_period != expected_period)
+        {
+            printf("  FAILED: Timer A value %u should give period %u, got %u\n",
+                   timerA_value, expected_period, calculated_period);
+            passed = 0;
+        }
+    }
+    
+    if (passed)
+    {
+        printf("  PASSED: Timer A period calculation test completed (%d iterations)\n", 
+               TEST_ITERATIONS);
+    }
+    
+    return passed;
+}
+
+/**
+ * Property 4: Timer B Period Calculation
  * 
  * For any Timer B value (0-255), the timer period SHALL equal 
  * 384 * 16 * (256 - timerB_value) clock cycles.
+ * 
+ * **Feature: ymf271-emulation-improvement, Property 4: Timer B Period**
+ * **Validates: Requirements 4.2**
  * 
  * Test approach:
  * - Verify the period formula produces correct values for all inputs
@@ -80,7 +158,7 @@ static int test_timer_b_period_calculation(void)
     int iteration;
     int passed = 1;
     
-    printf("Property 13: Timer B Period Calculation\n");
+    printf("Property 4: Timer B Period Calculation\n");
     printf("  Testing Timer B period formula: 384 * 16 * (256 - value)...\n");
     
     /* Test boundary conditions first */
@@ -317,12 +395,20 @@ static int test_timer_b_register_write(void)
 
 int main(int argc, char* argv[])
 {
-    printf("YMF271 Timer B Property Tests\n");
-    printf("=============================\n\n");
+    printf("YMF271 Timer Property Tests\n");
+    printf("===========================\n\n");
     
     test_seed_init();
     
-    /* Property 13: Timer B Period Calculation */
+    /* Property 3: Timer A Period Calculation */
+    if (test_timer_a_period_calculation())
+        tests_passed++;
+    else
+        tests_failed++;
+    
+    printf("\n");
+    
+    /* Property 4: Timer B Period Calculation */
     if (test_timer_b_period_calculation())
         tests_passed++;
     else
@@ -343,7 +429,7 @@ int main(int argc, char* argv[])
     else
         tests_failed++;
     
-    printf("\n=============================\n");
+    printf("\n===========================\n");
     printf("Results: %d passed, %d failed\n", tests_passed, tests_failed);
     
     return tests_failed > 0 ? 1 : 0;
