@@ -75,7 +75,6 @@
 #include <stdlib.h>
 #include <string.h>	// for memset
 #include <stddef.h>	// for NULL
-#include <stdio.h>	// for fprintf (debug logging)
 #define _USE_MATH_DEFINES
 #include <math.h>
 
@@ -533,7 +532,8 @@ typedef struct
 	//emu_timer *m_timA;
 	//emu_timer *m_timB;
 	UINT32 mixbuf_smpls;
-	INT32 *mix_buffer;      // TODO: try removing this sometime
+	INT32 *mix_buffer;      // final 4-channel mix (after ACC + direct paths)
+	INT32 *acc_buffer;      // 18-bit ACC per-channel accumulator (shared across slots when Accon=1)
 
 	void (*irq_handler)(void *, UINT8);
 	void* irq_param;
@@ -563,7 +563,8 @@ INLINE void calculate_step(YMF271Chip *chip, YMF271Slot *slot)
 		// LFO phase modulation
 		st *= slot->lfo_phasemod;
 
-		st /= (double)(524288/65536); // pre-multiply with 65536
+		// 524288 / 65536 = 8, but keep as floating-point to avoid integer division
+		st /= (524288.0 / 65536.0); // pre-multiply with 65536
 
 		slot->step = (UINT32)st;
 	}
@@ -583,7 +584,8 @@ INLINE void calculate_step(YMF271Chip *chip, YMF271Slot *slot)
 		// LFO phase modulation
 		st *= slot->lfo_phasemod;
 
-		st /= (double)(536870912/65536); // pre-multiply with 65536
+		// 536870912 / 65536 = 8192, but keep as floating-point to avoid integer division
+		st /= (536870912.0 / 65536.0); // pre-multiply with 65536
 
 		slot->step = (UINT32)st;
 	}
@@ -939,14 +941,16 @@ static void update_pcm(YMF271Chip *chip, int slotnum, INT32 *mixp, UINT32 length
 		// Always log accon=1 slots (up to 50 times)
 		if (slot->accon == 1 && accon1_count < 50 && length > 0)
 		{
-			fprintf(stderr, "PCM ACCON=1 slot %d: startaddr=0x%06X, endaddr=0x%06X, stepptr=0x%08X, step=0x%08X, volume=%d, ch0=%d, ch1=%d, tl=%d, env_state=%d\n",
+			emu_logf(&chip->logger, DEVLOG_DEBUG,
+				"PCM ACCON=1 slot %d: startaddr=0x%06X, endaddr=0x%06X, stepptr=0x%08X, step=0x%08X, volume=%d, ch0=%d, ch1=%d, tl=%d, env_state=%d\n",
 				slotnum, slot->startaddr, slot->endaddr, (UINT32)(slot->stepptr >> 16), slot->step,
 				slot->volume >> 16, slot->ch0_level, slot->ch1_level, slot->tl, slot->env_state);
 			accon1_count++;
 		}
 		else if (debug_count < 200 && length > 0)
 		{
-			fprintf(stderr, "PCM slot %d: accon=%d, startaddr=0x%06X, endaddr=0x%06X, stepptr=0x%08X, volume=%d, ch0=%d, ch1=%d, active=%d\n",
+			emu_logf(&chip->logger, DEVLOG_DEBUG,
+				"PCM slot %d: accon=%d, startaddr=0x%06X, endaddr=0x%06X, stepptr=0x%08X, volume=%d, ch0=%d, ch1=%d, active=%d\n",
 				slotnum, slot->accon, slot->startaddr, slot->endaddr, (UINT32)(slot->stepptr >> 16), 
 				slot->volume >> 16, slot->ch0_level, slot->ch1_level, slot->active);
 			debug_count++;
@@ -1071,10 +1075,15 @@ static void update_pcm(YMF271Chip *chip, int slotnum, INT32 *mixp, UINT32 length
 			INT32 output;
 
 			// TL as accumulation multiplier
-			// TL=0 or 1: 1x (single waveform)
-			// TL=2: 2x (two waveforms accumulated)
-			// TL=N: Nx (N waveforms accumulated)
-			INT32 accumulation_factor = (slot->tl == 0) ? 1 : slot->tl;
+			// TL=0: base drive
+			// TL>0: proportional to TL (scaled)
+			// 
+			// Datasheet only defines TL as attenuation (0.75 dB/step) in the
+			// normal path. For the ACC path, the absolute drive scale is not
+			// specified, so we introduce a small empirical scaling factor here
+			// to match observed distortion strength on real hardware.
+#define ACC_TL_SCALE  2
+			INT32 accumulation_factor = (slot->tl == 0) ? ACC_TL_SCALE : (slot->tl * ACC_TL_SCALE);
 
 			// Accumulate waveforms (multiply by accumulation factor)
 			accumulated = (INT64)sample * accumulation_factor;
@@ -1098,10 +1107,34 @@ static void update_pcm(YMF271Chip *chip, int slotnum, INT32 *mixp, UINT32 length
 			 * Apply channel levels for volume and panning control
 			 *
 			 */
-			mixp[i*4+0] += (output * chip->lut_attenuation[slot->ch0_level]) >> 16;
-			mixp[i*4+1] += (output * chip->lut_attenuation[slot->ch1_level]) >> 16;
-			mixp[i*4+2] += (output * chip->lut_attenuation[slot->ch2_level]) >> 16;
-			mixp[i*4+3] += (output * chip->lut_attenuation[slot->ch3_level]) >> 16;
+			{
+				INT32 *accp = chip->acc_buffer;
+				INT64 acc;
+
+				// CH0
+				acc = accp[i*4+0] + ((output * chip->lut_attenuation[slot->ch0_level]) >> 16);
+				if (acc > ACC_18BIT_MAX) acc = ACC_18BIT_MAX;
+				else if (acc < ACC_18BIT_MIN) acc = ACC_18BIT_MIN;
+				accp[i*4+0] = (INT32)acc;
+
+				// CH1
+				acc = accp[i*4+1] + ((output * chip->lut_attenuation[slot->ch1_level]) >> 16);
+				if (acc > ACC_18BIT_MAX) acc = ACC_18BIT_MAX;
+				else if (acc < ACC_18BIT_MIN) acc = ACC_18BIT_MIN;
+				accp[i*4+1] = (INT32)acc;
+
+				// CH2
+				acc = accp[i*4+2] + ((output * chip->lut_attenuation[slot->ch2_level]) >> 16);
+				if (acc > ACC_18BIT_MAX) acc = ACC_18BIT_MAX;
+				else if (acc < ACC_18BIT_MIN) acc = ACC_18BIT_MIN;
+				accp[i*4+2] = (INT32)acc;
+
+				// CH3
+				acc = accp[i*4+3] + ((output * chip->lut_attenuation[slot->ch3_level]) >> 16);
+				if (acc > ACC_18BIT_MAX) acc = ACC_18BIT_MAX;
+				else if (acc < ACC_18BIT_MIN) acc = ACC_18BIT_MIN;
+				accp[i*4+3] = (INT32)acc;
+			}
 		}
 		else
 		{
@@ -1312,7 +1345,9 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 		if (proc_smpls > chip->mixbuf_smpls)
 			proc_smpls = chip->mixbuf_smpls;
 
-	memset(chip->mix_buffer, 0, sizeof(chip->mix_buffer[0])*proc_smpls*4);
+		// Clear per-chunk mix and ACC buffers
+		memset(chip->mix_buffer, 0, sizeof(chip->mix_buffer[0]) * proc_smpls * 4);
+		memset(chip->acc_buffer, 0, sizeof(chip->acc_buffer[0]) * proc_smpls * 4);
 
 	for (j = 0; j < 12; j++)
 	{
@@ -1868,6 +1903,15 @@ static void ymf271_update(void *info, UINT32 samples, DEV_SMPL** outputs)
 	// Using fixed-point: 0.02 ≈ 5/256
 	for (i = 0; i < proc_smpls; i++)
 	{
+		// First, fold shared 18-bit ACC output (Accon=1 slots) into mix buffer.
+		// acc_buffer holds 18-bit range values (±131071). We add them directly
+		// here and rely on the final >>2 (stereo mix attenuation) to map the
+		// 18-bit range back into the 16-bit DAC domain, matching non-ACC paths.
+		chip->mix_buffer[i*4+0] += chip->acc_buffer[i*4+0];
+		chip->mix_buffer[i*4+1] += chip->acc_buffer[i*4+1];
+		chip->mix_buffer[i*4+2] += chip->acc_buffer[i*4+2];
+		chip->mix_buffer[i*4+3] += chip->acc_buffer[i*4+3];
+
 		INT32 ch0 = chip->mix_buffer[i*4+0];  // front left
 		INT32 ch1 = chip->mix_buffer[i*4+1];  // front right
 		INT32 ch2 = chip->mix_buffer[i*4+2];  // rear left
@@ -1906,7 +1950,8 @@ static void write_register(YMF271Chip *chip, int slotnum, int reg, UINT8 data)
 				(void)bank;   // suppress unused warning when debug is disabled
 				
 #if 0  // DEBUG: Log key-on events - set to 1 to enable
-				fprintf(stderr, "KEY-ON slot %d: accon=%d, sync=%d, waveform=%d, startaddr=0x%06X, endaddr=0x%06X, tl=%d, ar=%d, ch0=%d, ch1=%d\n",
+				emu_logf(&chip->logger, DEVLOG_DEBUG,
+					"KEY-ON slot %d: accon=%d, sync=%d, waveform=%d, startaddr=0x%06X, endaddr=0x%06X, tl=%d, ar=%d, ch0=%d, ch1=%d\n",
 					slotnum, slot->accon, group->sync, slot->waveform, slot->startaddr, slot->endaddr,
 					slot->tl, slot->ar, slot->ch0_level, slot->ch1_level);
 #endif
@@ -1925,7 +1970,8 @@ static void write_register(YMF271Chip *chip, int slotnum, int reg, UINT8 data)
 #if 0  // DEBUG: Log step after calculation - set to 1 to enable
 				if (slot->accon == 1)
 				{
-					fprintf(stderr, "  ACCON=1 slot %d after init: step=0x%08X, volume=%d, env_state=%d, lfo_phasemod=%f\n",
+					emu_logf(&chip->logger, DEVLOG_DEBUG,
+						"  ACCON=1 slot %d after init: step=0x%08X, volume=%d, env_state=%d, lfo_phasemod=%f\n",
 						slotnum, slot->step, slot->volume >> 16, slot->env_state, slot->lfo_phasemod);
 				}
 #endif
@@ -2696,13 +2742,13 @@ static void init_tables(YMF271Chip *chip)
 		// LFO phase modulation
 		plfo[0] = 0;
 
-		fsaw_wave = ((i % (LFO_LENGTH/2)) * PLFO_MAX) / (double)((LFO_LENGTH/2)-1);
-		plfo[1] = (i < (LFO_LENGTH/2)) ? fsaw_wave : fsaw_wave - PLFO_MAX;
+		fsaw_wave = ((i % (LFO_LENGTH / 2)) * PLFO_MAX) / ((LFO_LENGTH / 2.0) - 1.0);
+		plfo[1] = (i < (LFO_LENGTH / 2)) ? fsaw_wave : fsaw_wave - PLFO_MAX;
 
-		plfo[2] = (i < (LFO_LENGTH/2)) ? PLFO_MAX : PLFO_MIN;
+		plfo[2] = (i < (LFO_LENGTH / 2)) ? PLFO_MAX : PLFO_MIN;
 
-		ftri_wave = ((i % (LFO_LENGTH/4)) * PLFO_MAX) / (double)(LFO_LENGTH/4);
-		switch (i / (LFO_LENGTH/4))
+		ftri_wave = ((i % (LFO_LENGTH / 4)) * PLFO_MAX) / (LFO_LENGTH / 4.0);
+		switch (i / (LFO_LENGTH / 4))
 		{
 			case 0: plfo[3] = ftri_wave; break;
 			case 1: plfo[3] = PLFO_MAX - ftri_wave; break;
@@ -2800,6 +2846,7 @@ static UINT8 device_start_ymf271(const DEV_GEN_CFG* cfg, DEV_INFO* retDevInf)
 
 	chip->mixbuf_smpls = rate / 10;
 	chip->mix_buffer = (INT32*)malloc(chip->mixbuf_smpls*4 * sizeof(INT32));
+	chip->acc_buffer = (INT32*)malloc(chip->mixbuf_smpls*4 * sizeof(INT32));
 
 	ymf271_set_mute_mask(chip, 0x000);
 
@@ -2825,6 +2872,7 @@ void device_stop_ymf271(void *info)
 		free(chip->lut_alfo[i]);
 	
 	free(chip->mix_buffer);
+	free(chip->acc_buffer);
 	free(chip);
 	
 	return;
