@@ -21,6 +21,7 @@
 #include <stddef.h>	// for NULL
 
 #include "../../stdtype.h"
+#include "../../common_def.h"
 #include "es5510.h"
 
 
@@ -371,12 +372,12 @@ static void execute_run(ES5510* chip);
  * --------------------------------------------------------------------------- */
 
 // TODO (MAME): Masked address?
-static inline INT16 dram_r(const ES5510* chip, INT32 addr)
+INLINE INT16 dram_r(const ES5510* chip, INT32 addr)
 {
 	return chip->dram[(UINT32)addr & chip->dram_mask];
 }
 
-static inline void dram_w(ES5510* chip, INT32 addr, INT16 data)
+INLINE void dram_w(ES5510* chip, INT32 addr, INT16 data)
 {
 	chip->dram[(UINT32)addr & chip->dram_mask] = data;
 }

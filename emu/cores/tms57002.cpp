@@ -1263,9 +1263,18 @@ void tms57002::decode_cat3(u32 opcode, unsigned short *op, cstate *cs)
     opcode implementations (tmsops.cpp)
 ***************************************************************************/
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4244 4267)
+#endif
+
 #define CINTRP
 #include "tms57002_ops.hxx"
 #undef CINTRP
+
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 /***************************************************************************
     state image

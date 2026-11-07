@@ -88,6 +88,7 @@ static void device_stop_zsg2(void *info);
 static void device_reset_zsg2(void *info);
 
 static void zsg2_ext_w(void *info, UINT16 addr, UINT16 data);
+static UINT16 zsg2_r16(void *info, UINT16 offset);
 static void zsg2_alloc_rom(void *info, UINT32 memsize);
 static void zsg2_write_rom(void *info, UINT32 offset, UINT32 length, const UINT8* data);
 static void zsg2_dsp_state_size(void *info, UINT32 memsize);
@@ -100,6 +101,7 @@ static void zsg2_set_srchg_cb(void *info, DEVCB_SRATE_CHG CallbackFunc, void* Da
 static DEVDEF_RWFUNC devFunc[] =
 {
 	{RWF_REGISTER | RWF_WRITE, DEVRW_A16D16, ZSG2_RWUSER_EXT, zsg2_ext_w},
+	{RWF_REGISTER | RWF_READ,  DEVRW_A16D16, 0, zsg2_r16},
 	{RWF_MEMORY | RWF_WRITE, DEVRW_MEMSIZE, ZSG2_RWUSER_ROM, zsg2_alloc_rom},
 	{RWF_MEMORY | RWF_WRITE, DEVRW_BLOCK, ZSG2_RWUSER_ROM, zsg2_write_rom},
 	{RWF_MEMORY | RWF_WRITE, DEVRW_MEMSIZE, ZSG2_RWUSER_DSPSTATE, zsg2_dsp_state_size},
@@ -511,6 +513,41 @@ static void zsg2_write(ZSG2Chip* chip, UINT16 offset, UINT16 data)
 	}
 }
 
+static UINT16 zsg2_read(ZSG2Chip* chip, UINT16 offset)
+{
+	if (offset < 0x300)
+	{
+		int ch = offset >> 4;
+		int reg = offset & 0xf;
+		return chip->chan[ch].v[reg];
+	}
+	else
+	{
+		int reg = offset - 0x300;
+		if (reg == 0x1e)	// 0x63c: ROM 回读低 16 位
+		{
+			UINT32 block = read_memory(chip, chip->read_address);
+			return (UINT16)(block & 0xffff);
+		}
+		else if (reg == 0x1f)	// 0x63e: ROM 回读高 16 位
+		{
+			UINT32 block = read_memory(chip, chip->read_address);
+			return (UINT16)(block >> 16);
+		}
+		else if (reg < 0x20)
+		{
+			return chip->reg[reg];
+		}
+		return 0;
+	}
+}
+
+static UINT16 zsg2_r16(void *info, UINT16 offset)
+{
+	ZSG2Chip* chip = (ZSG2Chip*)info;
+	return zsg2_read(chip, offset);
+}
+
 static void zsg2_update(void *param, UINT32 samples, DEV_SMPL **outputs)
 {
 	ZSG2Chip* chip = (ZSG2Chip*)param;
@@ -621,8 +658,15 @@ static void zsg2_update(void *param, UINT32 samples, DEV_SMPL **outputs)
 			outl += (so * chip->gain_outl[output]) >> 8;
 			outr += (so * chip->gain_outr[output]) >> 8;
 		}
-		outputs[0][i] = (DEV_SMPL)(outl >> 8);
-		outputs[1][i] = (DEV_SMPL)(outr >> 8);
+		INT32 valL = (INT32)(outl >> 8);
+		INT32 valR = (INT32)(outr >> 8);
+		// 动态饱和保护：防止多发声通道与 DSP 混响反馈叠加超出 16 位范围发生数值溢出削顶杂音
+		if (valL > 32767) valL = 32767;
+		else if (valL < -32768) valL = -32768;
+		if (valR > 32767) valR = 32767;
+		else if (valR < -32768) valR = -32768;
+		outputs[0][i] = (DEV_SMPL)valL;
+		outputs[1][i] = (DEV_SMPL)valR;
 
 		// start the next program pass
 		tms57002_sync(chip->dsp);
@@ -702,8 +746,15 @@ static void zsg2_write_rom(void *info, UINT32 offset, UINT32 length, const UINT8
 		length = chip->rom_size - offset;
 
 	memcpy(chip->rom + offset, data, length);
-	// invalidate the decompression cache of the written blocks
-	memset(&chip->mem_copy[offset / 4], 0x00, ((length + 3) / 4) * sizeof(UINT32));
+	// 刷新已写入数据对应样本解压块的缓存（保证跨块写入时所有涉及的缓存均被正确置零）
+	{
+		UINT32 start_block = offset / 4;
+		UINT32 end_block = (offset + length + 3) / 4;
+		if (end_block > chip->mem_blocks)
+			end_block = chip->mem_blocks;
+		if (end_block > start_block && chip->mem_copy != NULL)
+			memset(&chip->mem_copy[start_block], 0x00, (end_block - start_block) * sizeof(UINT32));
+	}
 }
 
 // data block 0x98: complete state of the DSP (program, coefficients, memories, registers)
@@ -801,9 +852,17 @@ static void zsg2_set_mute_mask(void *info, UINT32 MuteMask)
 	ZSG2Chip* chip = (ZSG2Chip*)info;
 	int ch;
 
-	// 48 channels, the mask covers the first 32
-	for (ch = 0; ch < ZSG2_CHANNELS; ch++)
-		chip->chan[ch].Muted = (ch < 32) ? ((MuteMask >> ch) & 0x01) : 0;
+	// ZSG-2 包含 48 个复音声道。当 MuteMask 全置位（0xFFFFFFFF）时执行整芯片静音；否则按掩码映射前 32 通道
+	if (MuteMask == 0xFFFFFFFF)
+	{
+		for (ch = 0; ch < ZSG2_CHANNELS; ch++)
+			chip->chan[ch].Muted = 1;
+	}
+	else
+	{
+		for (ch = 0; ch < ZSG2_CHANNELS; ch++)
+			chip->chan[ch].Muted = (ch < 32) ? ((MuteMask >> ch) & 0x01) : 0;
+	}
 }
 
 static void zsg2_set_srchg_cb(void *info, DEVCB_SRATE_CHG CallbackFunc, void* DataPtr)
