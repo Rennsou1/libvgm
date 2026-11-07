@@ -278,7 +278,8 @@ static inline INT32 alu_asl(INT32 value, int shift, UINT8* flags)
 		? ((shifted < 0) ? 0x00800000 : 0x007fffff)
 		: ((INT32)shifted & 0x00ffffff);
 
-	*flags = setFlagTo(*flags, FLAG_C, carry);
+	// 根据 ES5510 官方规范 Rev 2.4 第 14 页：ASL2 与 ASL8 不影响 C 与 LT 标志位，更新 V（饱和）、N、Z
+	(void)carry;
 	*flags = setFlagTo(*flags, FLAG_V, overflow);
 	*flags = setFlagTo(*flags, FLAG_N, (result & 0x00800000) != 0);
 	*flags = setFlagTo(*flags, FLAG_Z, (result & 0x00ffffff) == 0);
@@ -516,7 +517,8 @@ UINT8 es5510_host_r(ES5510* chip, UINT8 offset)
 	case 0x10: return (chip->dadr_latch >>  8) & 0xff;
 	case 0x11: return (chip->dadr_latch >>  0) & 0xff;
 
-	case 0x12: return 0;	// Host Control
+	// 官方规范第 34、38 页：主机控制寄存器（Bit 2: Host Access OK/, Bit 1: RAM Clear, Bit 0: Refresh Disable）
+	case 0x12: return chip->host_control & 0x07;
 
 	case 0x16: return 0x27;	// Program Counter, for test purposes only
 	}
@@ -561,13 +563,18 @@ void es5510_host_w(ES5510* chip, UINT8 offset, UINT8 data)
 
 	case 0x0f:
 		chip->dadr_latch = (chip->dadr_latch & 0x00ffff) | ((UINT32)(data & 0xff) << 16);
-		if (chip->ram_sel)
+		// 官方规范第 37 页：DADR 寄存器地址在 24 位中左对齐；
+		// 实际 DRAM 字地址需右移 memshift 位，与微指令内部寻址完全一致
 		{
-			chip->dil_latch = shl32(dram_r(chip, (INT32)chip->dadr_latch), 8);
-		}
-		else
-		{
-			dram_w(chip, (INT32)chip->dadr_latch, (INT16)(chip->dol_latch >> 8));
+			INT32 word_addr = (INT32)(chip->dadr_latch >> chip->memshift);
+			if (chip->ram_sel)
+			{
+				chip->dil_latch = shl32(dram_r(chip, word_addr), 8);
+			}
+			else
+			{
+				dram_w(chip, word_addr, (INT16)(chip->dol_latch >> 8));
+			}
 		}
 		break;
 
@@ -1095,11 +1102,15 @@ static void write_reg(ES5510* chip, UINT8 reg, INT32 value)
 			chip->sigreg = value;
 			chip->mulshift = ((chip->sigreg >> 22) & 1) ? 1 : 2;	// BIT(sigreg, 22)
 			break;
-		// NOTE: MAME's WRITE_REG(r, x) macro expands to "r = value" and ignores its
-		// second argument, so CCR/CMR receive the low 8 bits of the (24-bit) value,
-		// not "(value >> 16) & FLAG_MASK". Replicated for bit-exactness.
-		case 250: chip->ccr = (INT8)value; break;
-		case 251: chip->cmr = (INT8)value; break;
+		// 根据 ES5510 官方规范第 9、13、27-29 页：
+		// CCR（Bit 23..19: N, C, V, LT, Z）与 CMR（Bit 23..18: N, C, V, LT, Z, NOT）映射在 24 位操作数的高字节。
+		// 历史 MAME 曾因宏定义将 (value >> 16) 截断为低 8 位；此处同时兼容高字节（硬件标准）与低字节（旧版兼容）。
+		case 250:
+			chip->ccr = (INT8)(((value & 0xf80000) != 0) ? ((value >> 16) & 0xf8) : (value & 0xf8));
+			break;
+		case 251:
+			chip->cmr = (INT8)(((value & 0xfc0000) != 0) ? ((value >> 16) & 0xfc) : (value & 0xfc));
+			break;
 		case 252: break;	// minus_one: no-op
 		case 253: break;	// min: no-op
 		case 254: break;	// max: no-op
@@ -1195,9 +1206,8 @@ static INT32 alu_operation(UINT8 op, INT32 a, INT32 b, UINT8* flags)
 		*flags = clearFlag(*flags, FLAG_N);
 		isNegative = (b & 0x00800000) != 0;
 		*flags = setFlagTo(*flags, FLAG_C, isNegative);
-		// Note: the absolute value is calculated by one's complement!
+		// 官方规范第 14 页：ABS 操作不改变 V、LT 与 Z 标志位！绝对值使用反码（One's complement）计算
 		result = isNegative ? (0x00ffffff ^ b) : b;
-		*flags = setFlagTo(*flags, FLAG_Z, (result & 0x00ffffff) == 0);
 		return result;
 	}
 
@@ -1211,8 +1221,10 @@ static INT32 alu_operation(UINT8 op, INT32 a, INT32 b, UINT8* flags)
 		return alu_asl(b, 8, flags);
 
 	case 0xc:	// LS15
+		// 官方规范第 12 与 14 页（注 3）：左移 15 位并清除符号位；
+		// C 标志位接收在符号位被清除的移位位（即原操作数 B 的第 8 位），V、LT、Z 保持不变
 		*flags = clearFlag(*flags, FLAG_N);
-		*flags = setFlagTo(*flags, FLAG_C, (b & 0x00800000) != 0);
+		*flags = setFlagTo(*flags, FLAG_C, ((b >> 8) & 1) != 0);
 		return shl32(b, 15) & 0x007fffff;
 
 	case 0xd:	// DIFF

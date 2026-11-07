@@ -401,7 +401,12 @@ static void compute_tables(ES550XChip* chip, UINT32 total_volume_bit, UINT32 exp
 		const UINT32 exponent = (i >> mantissa_bit) & exponent_mask;
 		const UINT32 mantissa = (i & mantissa_mask) | mantissa_len;
 
-		chip->volume_lookup[i] = (mantissa << mantissa_shift) >> (exponent_shift - exponent);
+		// 根据 ES5505 (OTIS) 规范第 16 页及 ES5506 (OTTO) 规范第 11 页：
+		// 指数 Exponent 0 为硬件静音（全 0 输出），而非 (1.MMMM) >> 15
+		if (exponent == 0)
+			chip->volume_lookup[i] = 0;
+		else
+			chip->volume_lookup[i] = (mantissa << mantissa_shift) >> (exponent_shift - exponent);
 	}
 	chip->volume_acc_shift = (16 + exponent_mask) - VOLUME_ACC_BIT;
 
